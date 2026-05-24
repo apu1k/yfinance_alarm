@@ -32,10 +32,6 @@ def request_stream_reload():
 def run_market_stream():
     watcher = _ensure_watcher()
     watcher.start()
-    while True:
-        # keep the background thread alive for dc.py's existing to_thread wrapper
-        import time
-        time.sleep(3600)
 
 
 def stop_market_stream():

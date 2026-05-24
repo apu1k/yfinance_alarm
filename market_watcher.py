@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import yfinance as yf
+from yfinance.live import WebSocket
 
 
 class MarketWatcher:
@@ -40,7 +41,13 @@ class MarketWatcher:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-        self._ws = None
+        self._stream_lock = threading.Lock()
+        self._stream_thread: Optional[threading.Thread] = None
+        self._stream_stop_event: Optional[threading.Event] = None
+        self._stream_ws = None
+        self._stream_symbols: List[str] = []
+        self._stream_generation = 0
+
         self._logged_sample = False
         self._last_msg_ts = 0.0
         self._reconnect_count = 0
@@ -58,6 +65,8 @@ class MarketWatcher:
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
         self._cmd_q.put({"type": "stop"})
+        if self._stream_stop_event is not None:
+            self._stream_stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
 
@@ -75,7 +84,8 @@ class MarketWatcher:
             "symbols": symbols,
             "symbol_count": len(symbols),
             "queue_size": self._cmd_q.qsize(),
-            "connected": self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set(),
+            "connected": self._stream_thread is not None and self._stream_thread.is_alive(),
+            "stream_symbols": list(self._stream_symbols),
             "last_msg_age_sec": age,
             "reconnect_count": self._reconnect_count,
         }
@@ -211,44 +221,157 @@ class MarketWatcher:
             with self._rules_lock:
                 desired_symbols = sorted(self._rules.keys())
 
-            if not desired_symbols:
-                current_symbols = []
-                time.sleep(self.idle_sleep_seconds)
-                continue
+            stream_dead = (
+                bool(desired_symbols)
+                and (self._stream_thread is None or not self._stream_thread.is_alive())
+            )
 
-            if desired_symbols != current_symbols:
+            if desired_symbols != current_symbols or stream_dead:
+                self._replace_stream(desired_symbols)
                 current_symbols = desired_symbols
 
-            print(f"[WATCHER] streaming: {' '.join(current_symbols)}")
+            time.sleep(self.idle_sleep_seconds)
 
-            try:
-                tickers = yf.Tickers(" ".join(current_symbols))
+        self._stop_stream(timeout=2.0)
 
-                def on_message(msg):
-                    if self._stop_event.is_set():
-                        return
+    def _replace_stream(self, symbols: List[str]) -> None:
+        self._stop_stream(timeout=2.0)
 
-                    self._last_msg_ts = time.time()
+        self._stream_symbols = list(symbols)
+        if not symbols:
+            return
 
-                    if not self._logged_sample:
-                        try:
-                            print(f"[WATCHER] sample message type={type(msg).__name__}: {msg}")
-                        except Exception:
-                            print("[WATCHER] sample message could not be printed")
-                        self._logged_sample = True
+        self._stream_generation += 1
+        generation = self._stream_generation
+        stream_stop_event = threading.Event()
+        self._stream_stop_event = stream_stop_event
+        self._logged_sample = False
 
-                    if isinstance(msg, dict):
-                        self._handle_tick(msg)
-                    elif isinstance(msg, list):
-                        for item in msg:
-                            if isinstance(item, dict):
-                                self._handle_tick(item)
+        self._stream_thread = threading.Thread(
+            target=self._stream_worker,
+            args=(list(symbols), stream_stop_event, generation),
+            name=f"MarketStream-{generation}",
+            daemon=True,
+        )
+        self._stream_thread.start()
 
-                tickers.live(message_handler=on_message, verbose=False)
-            except Exception as e:
+    def _stop_stream(self, timeout: float = 2.0) -> None:
+        thread = self._stream_thread
+        stop_event = self._stream_stop_event
+
+        if stop_event is not None:
+            stop_event.set()
+
+        self._close_stream_socket()
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                print(
+                    f"[WATCHER] yfinance live stream did not exit within {timeout:.1f}s; "
+                    "stale callbacks are disabled"
+                )
+
+        if thread is self._stream_thread and (thread is None or not thread.is_alive()):
+            self._stream_thread = None
+            self._stream_stop_event = None
+            self._stream_ws = None
+            self._stream_symbols = []
+
+    def _close_stream_socket(self) -> None:
+        with self._stream_lock:
+            ws = self._stream_ws
+
+        if ws is None:
+            return
+
+        try:
+            ws.close()
+        except Exception as e:
+            print(f"[WATCHER] failed to close yfinance websocket: {e!r}")
+
+    def _stream_worker(
+        self,
+        symbols: List[str],
+        stream_stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        print(f"[WATCHER] streaming: {' '.join(symbols)}")
+
+        ws = None
+        try:
+            ws = WebSocket(verbose=False)
+            with self._stream_lock:
+                if generation == self._stream_generation:
+                    self._stream_ws = ws
+
+            ws.subscribe(symbols)
+
+            while (
+                not self._stop_event.is_set()
+                and not stream_stop_event.is_set()
+                and generation == self._stream_generation
+            ):
+                try:
+                    raw_message = ws._ws.recv(timeout=1.0)
+                except TimeoutError:
+                    continue
+                except Exception:
+                    if (
+                        self._stop_event.is_set()
+                        or stream_stop_event.is_set()
+                        or generation != self._stream_generation
+                    ):
+                        break
+                    raise
+
+                message_json = json.loads(raw_message)
+                encoded_data = message_json.get("message", "")
+                decoded_message = ws._decode_message(encoded_data)
+                self._handle_stream_message(decoded_message, stream_stop_event, generation)
+        except Exception as e:
+            if not self._stop_event.is_set() and not stream_stop_event.is_set():
                 self._reconnect_count += 1
                 print(f"[WATCHER] stream error: {e} (reconnect_count={self._reconnect_count})")
-                time.sleep(2)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+            with self._stream_lock:
+                if generation == self._stream_generation and self._stream_ws is ws:
+                    self._stream_ws = None
+
+    def _handle_stream_message(
+        self,
+        msg,
+        stream_stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        if (
+            self._stop_event.is_set()
+            or stream_stop_event.is_set()
+            or generation != self._stream_generation
+        ):
+            return
+
+        self._last_msg_ts = time.time()
+
+        if not self._logged_sample:
+            try:
+                print(f"[WATCHER] sample message type={type(msg).__name__}: {msg}")
+            except Exception:
+                print("[WATCHER] sample message could not be printed")
+            self._logged_sample = True
+
+        if isinstance(msg, dict):
+            self._handle_tick(msg)
+        elif isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    self._handle_tick(item)
 
     def _drain_commands(self) -> None:
         drained = False

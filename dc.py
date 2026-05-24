@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sys
 
 import discord
 from discord.ext import commands
@@ -40,23 +39,11 @@ except ValueError as e:
     raise RuntimeError(f"Invalid CHANNEL_ID: {CHANNEL_ID_RAW!r}") from e
 
 
-async def restart_self(delay_seconds: float = 1.0):
-    await asyncio.sleep(delay_seconds)
-    try:
-        stop_market_stream()
-    except Exception as e:
-        print(f"[BOT] stop_market_stream before restart failed: {e!r}")
-    print("[BOT] restarting process to refresh live subscriptions...")
-    sys.stdout.flush()
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.market_task = None
 
     async def send_market_alert(self, text: str):
         try:
@@ -78,9 +65,8 @@ class MyBot(commands.Bot):
 
         set_alert_sender(sender)
 
-        if self.market_task is None or self.market_task.done():
-            self.market_task = asyncio.create_task(asyncio.to_thread(run_market_stream))
-            print("[BOT] MarketWatcher started")
+        run_market_stream()
+        print("[BOT] MarketWatcher started")
 
 
 bot = MyBot()
@@ -133,10 +119,9 @@ async def add_target(
 
     if result is not None:
         await interaction.followup.send(
-            f"{result}\nApplying change: restarting bot to refresh live subscriptions...",
+            f"{result}\nStream reload requested.",
             ephemeral=True,
         )
-        asyncio.create_task(restart_self())
     else:
         await interaction.followup.send(search_ticker_yfin(ticker), ephemeral=True)
 
@@ -195,10 +180,9 @@ async def delete_target(
     ticker = ticker.strip().upper()
     result = delete_target_yfin(ticker, idx)
     await interaction.followup.send(
-        f"{result}\nApplying change: restarting bot to refresh live subscriptions...",
+        f"{result}\nStream reload requested.",
         ephemeral=True,
     )
-    asyncio.create_task(restart_self())
 
 
 @bot.tree.command(
