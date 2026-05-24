@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import queue
 import threading
@@ -211,13 +212,261 @@ class MarketWatcher:
             self.data_file.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
 
     # ---------------------------
+    # Offline catch-up checks
+    # ---------------------------
+    def _catch_up_missed_targets(self) -> None:
+        """Check whether stored targets were hit while the bot was offline.
+
+        The live websocket only sees ticks while the process is running. On
+        startup/reload, use historical candles from each rule's last_check until
+        now and remove/send alerts for targets that were touched in that range.
+        """
+        now_ms = int(time.time() * 1000)
+
+        with self._rules_lock:
+            snapshot = {}
+            for ticker, entries in self._rules.items():
+                if isinstance(entries, dict):
+                    entries = [entries]
+                if isinstance(entries, list):
+                    snapshot[ticker] = [dict(rule) for rule in entries if isinstance(rule, dict)]
+
+        if not snapshot:
+            return
+
+        print(f"[WATCHER] catch-up check starting for {len(snapshot)} ticker(s)")
+
+        changed = False
+        next_rules: Dict[str, List[dict]] = {}
+
+        for ticker, rules in snapshot.items():
+            remaining: List[dict] = []
+
+            for rule in rules:
+                target = rule.get("price-target")
+                above = rule.get("above", True)
+                last_check = rule.get("last_check")
+
+                if target is None:
+                    remaining.append(rule)
+                    continue
+
+                try:
+                    target_price = float(target)
+                except (TypeError, ValueError):
+                    remaining.append(rule)
+                    continue
+
+                try:
+                    since_ms = int(last_check)
+                except (TypeError, ValueError):
+                    since_ms = now_ms
+                    rule["last_check"] = now_ms
+                    changed = True
+
+                if since_ms >= now_ms:
+                    if since_ms > now_ms:
+                        print(
+                            f"[WATCHER] last_check for {ticker} is in the future; "
+                            "resetting it to now"
+                        )
+                        rule["last_check"] = now_ms
+                        changed = True
+                    remaining.append(rule)
+                    continue
+
+                hit, checked_until_ms, hit_price = self._check_target_range(
+                    ticker=ticker,
+                    target=target_price,
+                    above=bool(above),
+                    since_ms=since_ms,
+                    until_ms=now_ms,
+                )
+
+                if hit:
+                    direction = "above" if above else "below"
+                    price_part = f" at {hit_price:.4f}" if hit_price is not None else ""
+                    alert_text = (
+                        f"🚨 ALERT: {ticker} hit target {target_price:g}{price_part} "
+                        f"while bot was offline ({direction})"
+                    )
+                    print(alert_text)
+                    if self.alert_sender is not None:
+                        try:
+                            self.alert_sender(alert_text)
+                        except Exception as e:
+                            print(f"[WATCHER] alert sender error during catch-up: {e}")
+                    changed = True
+                    continue
+
+                if checked_until_ms is None:
+                    print(
+                        f"[WATCHER] catch-up could not verify {ticker}; "
+                        "keeping old last_check"
+                    )
+                    remaining.append(rule)
+                    continue
+
+                new_last_check = max(since_ms, checked_until_ms)
+                if rule.get("last_check") != new_last_check:
+                    rule["last_check"] = new_last_check
+                    changed = True
+                    print(
+                        f"[WATCHER] catch-up checked {ticker}: "
+                        f"{since_ms} -> {new_last_check}"
+                    )
+                remaining.append(rule)
+
+            if remaining:
+                next_rules[ticker] = remaining
+            else:
+                changed = True
+
+        if changed:
+            with self._rules_lock:
+                self._rules = next_rules
+            self._save_rules()
+
+        print("[WATCHER] catch-up check finished")
+
+    def _check_target_range(
+        self,
+        ticker: str,
+        target: float,
+        above: bool,
+        since_ms: int,
+        until_ms: int,
+    ) -> tuple[bool, Optional[int], Optional[float]]:
+        """Return whether target was hit between since_ms and until_ms.
+
+        Uses candle High/Low so short touches are not missed. For very recent
+        intraday data, Yahoo/yfinance is more reliable with period=... than with
+        a narrow start/end window, so fetch a wider period and filter locally.
+        """
+        if since_ms >= until_ms:
+            return False, None, None
+
+        age_seconds = max(0.0, (until_ms - since_ms) / 1000.0)
+        if age_seconds <= 24 * 3600:
+            interval = "1m"
+            period = "1d"
+        elif age_seconds <= 5 * 24 * 3600:
+            interval = "1m"
+            period = "5d"
+        elif age_seconds <= 30 * 24 * 3600:
+            interval = "5m"
+            period = "1mo"
+        elif age_seconds <= 60 * 24 * 3600:
+            interval = "15m"
+            period = "3mo"
+        else:
+            interval = "1d"
+            period = "1y"
+
+        ticker_obj = yf.Ticker(ticker)
+        hist = None
+
+        try:
+            hist = ticker_obj.history(
+                period=period,
+                interval=interval,
+                prepost=True,
+                actions=False,
+                auto_adjust=False,
+                raise_errors=False,
+            )
+        except Exception as e:
+            print(f"[WATCHER] catch-up period history failed for {ticker}: {e}")
+
+        if hist is None or hist.empty:
+            start = dt.datetime.fromtimestamp(since_ms / 1000, tz=dt.timezone.utc)
+            end = dt.datetime.fromtimestamp(until_ms / 1000, tz=dt.timezone.utc)
+            if interval == "1m":
+                end += dt.timedelta(minutes=5)
+            elif interval in {"5m", "15m"}:
+                end += dt.timedelta(minutes=30)
+            else:
+                end += dt.timedelta(days=1)
+
+            try:
+                hist = ticker_obj.history(
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    prepost=True,
+                    actions=False,
+                    auto_adjust=False,
+                    raise_errors=False,
+                )
+            except Exception as e:
+                print(f"[WATCHER] catch-up start/end history failed for {ticker}: {e}")
+                return False, None, None
+
+        if hist is None or hist.empty:
+            print(
+                f"[WATCHER] catch-up history empty for {ticker} "
+                f"(period={period}, interval={interval})"
+            )
+            return False, None, None
+
+        try:
+            index_ms = [int(ts.to_pydatetime().timestamp() * 1000) for ts in hist.index]
+        except Exception as e:
+            print(f"[WATCHER] catch-up could not read timestamps for {ticker}: {e}")
+            return False, None, None
+
+        mask = [(ts_ms > since_ms and ts_ms <= until_ms) for ts_ms in index_ms]
+        if not any(mask):
+            newest_ms = max(index_ms) if index_ms else None
+            print(
+                f"[WATCHER] catch-up no candles in requested range for {ticker} "
+                f"(period={period}, interval={interval}, newest={newest_ms})"
+            )
+            return False, None, None
+
+        hist = hist.loc[mask]
+        filtered_index_ms = [ts_ms for ts_ms, keep in zip(index_ms, mask) if keep]
+
+        if hist.empty or not filtered_index_ms:
+            return False, None, None
+
+        checked_until_ms = max(filtered_index_ms)
+
+        if above:
+            highs = hist.get("High")
+            if highs is None:
+                return False, checked_until_ms, None
+            highs = highs.dropna()
+            if highs.empty:
+                return False, checked_until_ms, None
+            max_high = float(highs.max())
+            return max_high >= target, checked_until_ms, max_high if max_high >= target else None
+
+        lows = hist.get("Low")
+        if lows is None:
+            return False, checked_until_ms, None
+        lows = lows.dropna()
+        if lows.empty:
+            return False, checked_until_ms, None
+        min_low = float(lows.min())
+        return min_low <= target, checked_until_ms, min_low if min_low <= target else None
+
+    # ---------------------------
     # Stream supervision
     # ---------------------------
     def _run(self) -> None:
         current_symbols: List[str] = []
+        needs_catch_up = True
 
         while not self._stop_event.is_set():
-            self._drain_commands()
+            reloaded = self._drain_commands()
+            if reloaded:
+                needs_catch_up = True
+
+            if needs_catch_up:
+                self._catch_up_missed_targets()
+                needs_catch_up = False
+
             with self._rules_lock:
                 desired_symbols = sorted(self._rules.keys())
 
@@ -373,25 +622,25 @@ class MarketWatcher:
                 if isinstance(item, dict):
                     self._handle_tick(item)
 
-    def _drain_commands(self) -> None:
-        drained = False
+    def _drain_commands(self) -> bool:
+        reloaded = False
         while True:
             try:
                 cmd = self._cmd_q.get_nowait()
             except queue.Empty:
                 break
 
-            drained = True
             ctype = cmd.get("type")
             if ctype == "stop":
                 self._stop_event.set()
             elif ctype == "reload":
-                with self._rules_lock:
-                    self._rules = self._load_rules()
+                reloaded = True
 
-        if drained:
+        if reloaded:
             with self._rules_lock:
                 self._rules = self._load_rules()
+
+        return reloaded
 
     # ---------------------------
     # Tick processing
@@ -438,7 +687,14 @@ class MarketWatcher:
                     pass
 
                 prev_last_check = rule.get("last_check")
-                if prev_last_check != normalized_tick_time:
+                should_update_last_check = normalized_tick_time is not None
+                try:
+                    if prev_last_check is not None and normalized_tick_time is not None:
+                        should_update_last_check = int(normalized_tick_time) > int(prev_last_check)
+                except (TypeError, ValueError):
+                    should_update_last_check = prev_last_check != normalized_tick_time
+
+                if should_update_last_check:
                     touched = True
                     rule["last_check"] = normalized_tick_time
                     print(
