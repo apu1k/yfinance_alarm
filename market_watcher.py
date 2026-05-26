@@ -351,16 +351,16 @@ class MarketWatcher:
             interval = "1m"
             period = "1d"
         elif age_seconds <= 5 * 24 * 3600:
-            interval = "1m"
+            interval = "1h"
             period = "5d"
         elif age_seconds <= 30 * 24 * 3600:
-            interval = "5m"
+            interval = "1d"
             period = "1mo"
         elif age_seconds <= 60 * 24 * 3600:
-            interval = "15m"
+            interval = "1d"
             period = "3mo"
         else:
-            interval = "1d"
+            interval = "1w"
             period = "1y"
 
         ticker_obj = yf.Ticker(ticker)
@@ -374,6 +374,14 @@ class MarketWatcher:
                 actions=False,
                 auto_adjust=False,
                 raise_errors=False,
+            )
+            hist_first = hist.index[0] if hist is not None and not hist.empty else None
+            hist_last = hist.index[-1] if hist is not None and not hist.empty else None
+            print(
+                f"[WATCHER] catch-up fetched {ticker}: rows={0 if hist is None else len(hist)} "
+                f"period={period} interval={interval} first={hist_first} last={hist_last} "
+                f"requested={dt.datetime.fromtimestamp(since_ms / 1000, tz=dt.timezone.utc).isoformat()}"
+                f"..{dt.datetime.fromtimestamp(until_ms / 1000, tz=dt.timezone.utc).isoformat()}"
             )
         except Exception as e:
             print(f"[WATCHER] catch-up period history failed for {ticker}: {e}")
@@ -410,17 +418,50 @@ class MarketWatcher:
             return False, None, None
 
         try:
-            index_ms = [int(ts.to_pydatetime().timestamp() * 1000) for ts in hist.index]
+            index_ms = []
+            for ts in hist.index:
+                py_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                if py_dt.tzinfo is None:
+                    py_dt = py_dt.replace(tzinfo=dt.timezone.utc)
+                else:
+                    py_dt = py_dt.astimezone(dt.timezone.utc)
+                index_ms.append(int(py_dt.timestamp() * 1000))
         except Exception as e:
-            print(f"[WATCHER] catch-up could not read timestamps for {ticker}: {e}")
+            print(f"[WATCHER] catch-up could not normalize timestamps for {ticker}: {e}")
             return False, None, None
 
-        mask = [(ts_ms > since_ms and ts_ms <= until_ms) for ts_ms in index_ms]
+        interval_ms = {
+            "1m": 60_000,
+            "5m": 5 * 60_000,
+            "15m": 15 * 60_000,
+            "1h": 60 * 60_000,
+            "1d": 24 * 60 * 60_000,
+            "1w": 7 * 24 * 60 * 60_000,
+        }.get(interval, 0)
+
+        # Candle timestamps are candle START times. A candle overlaps the
+        # requested range if its start is before/until the range end and its
+        # approximate end is after the previous last_check. Comparing only
+        # candle_start > since_ms drops the candle that contains since_ms.
+        mask = [((ts_ms + interval_ms) > since_ms and ts_ms <= until_ms) for ts_ms in index_ms]
         if not any(mask):
+            oldest_ms = min(index_ms) if index_ms else None
             newest_ms = max(index_ms) if index_ms else None
+            oldest_utc = (
+                dt.datetime.fromtimestamp(oldest_ms / 1000, tz=dt.timezone.utc).isoformat()
+                if oldest_ms is not None else None
+            )
+            newest_utc = (
+                dt.datetime.fromtimestamp(newest_ms / 1000, tz=dt.timezone.utc).isoformat()
+                if newest_ms is not None else None
+            )
+            since_utc = dt.datetime.fromtimestamp(since_ms / 1000, tz=dt.timezone.utc).isoformat()
+            until_utc = dt.datetime.fromtimestamp(until_ms / 1000, tz=dt.timezone.utc).isoformat()
             print(
-                f"[WATCHER] catch-up no candles in requested range for {ticker} "
-                f"(period={period}, interval={interval}, newest={newest_ms})"
+                f"[WATCHER] catch-up no overlapping candles for {ticker} "
+                f"(period={period}, interval={interval}, "
+                f"requested={since_ms}..{until_ms} UTC={since_utc}..{until_utc}, "
+                f"available={oldest_ms}..{newest_ms} UTC={oldest_utc}..{newest_utc})"
             )
             return False, None, None
 
@@ -662,6 +703,11 @@ class MarketWatcher:
         if ticker_symbol is None or price is None:
             return
 
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return
+
         with self._rules_lock:
             rules = self._rules.get(ticker_symbol)
             if rules is None:
@@ -680,19 +726,28 @@ class MarketWatcher:
                 if not isinstance(rule, dict):
                     continue
 
-                normalized_tick_time = tick_time
-                try:
-                    normalized_tick_time = int(tick_time) if tick_time is not None else tick_time
-                except (TypeError, ValueError):
-                    pass
+                normalized_tick_time = None
+                if tick_time is not None:
+                    try:
+                        normalized_tick_time = int(float(tick_time))
+                    except (TypeError, ValueError):
+                        normalized_tick_time = None
+
+                # yfinance live messages are epoch milliseconds today, but keep
+                # this defensive: if seconds ever arrive, normalize to ms.
+                if normalized_tick_time is not None and normalized_tick_time < 10_000_000_000:
+                    normalized_tick_time *= 1000
 
                 prev_last_check = rule.get("last_check")
-                should_update_last_check = normalized_tick_time is not None
                 try:
-                    if prev_last_check is not None and normalized_tick_time is not None:
-                        should_update_last_check = int(normalized_tick_time) > int(prev_last_check)
+                    prev_last_check_ms = int(prev_last_check) if prev_last_check is not None else None
                 except (TypeError, ValueError):
-                    should_update_last_check = prev_last_check != normalized_tick_time
+                    prev_last_check_ms = None
+
+                should_update_last_check = (
+                    normalized_tick_time is not None
+                    and (prev_last_check_ms is None or normalized_tick_time > prev_last_check_ms)
+                )
 
                 if should_update_last_check:
                     touched = True
